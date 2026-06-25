@@ -4,10 +4,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aymanhs/sys-tui/systemd"
+	"github.com/aymanhs/jeeves/systemd"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func (m *Model) handleListKey(msg tea.KeyMsg) tea.Cmd {
@@ -41,34 +42,35 @@ func (m *Model) handleListKey(msg tea.KeyMsg) tea.Cmd {
 			m.detailFocusedSection = focusInfo
 			m.activeDetail = selected // temporary details while fetching
 			m.logs = "Loading logs..."
-			m.logViewport.SetContent(m.logs)
-			m.recalculateViewportSize()
+			m.unitFile = "Loading unit file..."
+			m.logRawLineCount = 0
+			m.recalculateViewportSize() // also pushes content through refreshLogViewport
 			return m.fetchDetailsCmd(selected.Name)
 		}
 
 	case "s": // Start
 		if selected != nil {
-			return m.runActionCmd("start", selected.Name)
+			return m.requestAction("start", selected.Name)
 		}
 
 	case "t": // Stop
 		if selected != nil {
-			return m.runActionCmd("stop", selected.Name)
+			return m.requestAction("stop", selected.Name)
 		}
 
 	case "r": // Restart
 		if selected != nil {
-			return m.runActionCmd("restart", selected.Name)
+			return m.requestAction("restart", selected.Name)
 		}
 
 	case "e": // Enable
 		if selected != nil {
-			return m.runActionCmd("enable", selected.Name)
+			return m.requestAction("enable", selected.Name)
 		}
 
 	case "d": // Disable
 		if selected != nil {
-			return m.runActionCmd("disable", selected.Name)
+			return m.requestAction("disable", selected.Name)
 		}
 
 	case "/": // Filter
@@ -77,9 +79,14 @@ func (m *Model) handleListKey(msg tea.KeyMsg) tea.Cmd {
 		m.searchInput.SetValue(m.filterQuery)
 		return textinput.Blink
 
-	case "a": // Toggle view mode
-		m.showMode = (m.showMode + 1) % 2
+	case "a": // Toggle view mode: all → running → failed → all
+		m.showMode = (m.showMode + 1) % showModeCount
 		m.filterServices()
+
+	case "S": // Cycle sort mode
+		m.sortMode = (m.sortMode + 1) % sortModeCount
+		m.filterServices()
+		return m.triggerStatus(fmt.Sprintf("Sorting by %s", m.sortMode.String()), false)
 
 	case "R": // Refresh
 		return m.fetchServicesCmd()
@@ -102,7 +109,12 @@ func (m Model) renderListView() string {
 
 	// 2. Search / Filter bar
 	if m.filtering {
-		s.WriteString(m.searchInput.View() + "\n\n")
+		// While typing: framed input box + an explicit hint so the user can see
+		// that keypresses are being captured by the filter, not the list.
+		label := SearchActiveLabel.Render(" FILTER ")
+		input := SearchActiveBox.Render(m.searchInput.View())
+		hint := HelpDescStyle.Render("  Enter / Esc to apply")
+		s.WriteString(label + " " + input + hint + "\n\n")
 	} else if m.filterQuery != "" {
 		filterText := SearchPromptStyle.Render("Filter: ") + SearchInputStyle.Render(m.filterQuery)
 		infoText := HelpDescStyle.Render(" (press / to edit, esc to clear)")
@@ -111,19 +123,30 @@ func (m Model) renderListView() string {
 		s.WriteString(HelpDescStyle.Render("Press / to search/filter services, [a] to toggle view...") + "\n\n")
 	}
 
-	// 3. Mode display indicator
+	// 3. Mode + sort indicator
 	var modeLabel string
 	switch m.showMode {
 	case showRunning:
-		modeLabel = ActiveBadge.Render("Showing: Running Services Only")
+		modeLabel = ActiveBadge.Render("View: Running")
+	case showFailed:
+		modeLabel = FailedBadge.Render("View: Failed")
 	default:
-		modeLabel = HelpDescStyle.Render("Showing: All Services")
+		modeLabel = HelpDescStyle.Render("View: All")
 	}
-	s.WriteString(modeLabel + "\n\n")
+	sortLabel := HelpDescStyle.Render(fmt.Sprintf("  •  Sort: %s  •  %d shown",
+		m.sortMode.String(), len(m.filteredServices)))
+	s.WriteString(modeLabel + sortLabel + "\n\n")
 
 	// 4. Services Table
 	if len(m.filteredServices) == 0 {
-		s.WriteString("\n  No services found matching filters.\n")
+		switch {
+		case m.initialLoad:
+			s.WriteString("\n  " + HelpDescStyle.Render("Loading services...") + "\n")
+		case m.loading:
+			s.WriteString("\n  " + HelpDescStyle.Render("Refreshing...") + "\n")
+		default:
+			s.WriteString("\n  No services found matching filters.\n")
+		}
 	} else {
 		// Table Columns configuration
 		colStatusW := 12
@@ -146,11 +169,9 @@ func (m Model) renderListView() string {
 		s.WriteString(TableHeaderStyle.Render(headerRow) + "\n")
 		s.WriteString(lipgloss.NewStyle().Foreground(ColorDim).Render(strings.Repeat("-", m.width)) + "\n")
 
-		// Calculate scrolling viewport for list
-		maxRows := m.height - 12
-		if maxRows < 3 {
-			maxRows = 3 // sane minimum
-		}
+		// Calculate scrolling viewport for list. Must match listMaxRows() in
+		// model.go so the scroll-offset clamp and the renderer agree.
+		maxRows := m.listMaxRows()
 
 		start := m.scrollOffset
 		end := start + maxRows
@@ -212,17 +233,19 @@ func (m Model) renderListView() string {
 }
 
 func (m Model) formatActiveState(state string) string {
+	// Single colored word — no leading glyph. The color of the word IS the indicator;
+	// the bullet looked like a blob next to every row and added visual noise.
 	switch state {
 	case "active":
-		return ActiveBadge.Render("● active")
+		return ActiveBadge.Render("active")
 	case "failed":
-		return FailedBadge.Render("● failed")
+		return FailedBadge.Render("failed")
 	case "activating", "deactivating", "reloading":
-		return WarningBadge.Render("● " + state)
+		return WarningBadge.Render(state)
 	case "inactive":
-		return InactiveBadge.Render("● inactive")
+		return InactiveBadge.Render("inactive")
 	default:
-		return InactiveBadge.Render("● " + state)
+		return InactiveBadge.Render(state)
 	}
 }
 
@@ -248,42 +271,29 @@ func (m Model) formatEnableState(state string) string {
 }
 
 func (m Model) renderListFooter() string {
-	var f strings.Builder
-	f.WriteString("\n")
-
-	keys := []string{
+	return "\n" + RenderFooter([]string{
 		"↑/↓/k/j", "Navigate",
-		"Enter/→", "Details/Logs",
-		"s", "Start",
-		"t", "Stop",
-		"r", "Restart",
-		"e", "Enable",
-		"d", "Disable",
+		"Enter/→", "Details",
+		"s/t/r", "Start/Stop/Restart",
+		"e/d", "Enable/Disable",
 		"/", "Filter",
-		"a", "Toggle Filter",
+		"a", "View",
+		"S", "Sort",
 		"R", "Refresh",
-		"q/Ctrl+C", "Quit",
-	}
-
-	items := []string{}
-	for i := 0; i < len(keys); i += 2 {
-		items = append(items, fmt.Sprintf("%s %s", HelpKeyStyle.Render(keys[i]), HelpDescStyle.Render(keys[i+1])))
-	}
-
-	f.WriteString(FooterStyle.Render(strings.Join(items, "  •  ")))
-	return f.String()
+		"q", "Quit",
+	}, m.width)
 }
 
+// padRight returns s padded with spaces (or truncated with "…") to fit width
+// terminal cells. Unicode- and ANSI-safe: never slices in the middle of a
+// multi-byte rune or an escape sequence.
 func padRight(s string, width int) string {
 	visualWidth := lipgloss.Width(s)
 	if visualWidth > width {
-		if strings.Contains(s, "\x1b") {
-			return s // Don't truncate styled strings to avoid breaking ANSI codes
+		if width <= 1 {
+			return ansi.Truncate(s, width, "")
 		}
-		if width > 3 {
-			return s[:width-3] + "..."
-		}
-		return s[:width]
+		return ansi.Truncate(s, width, "…")
 	}
 	return s + strings.Repeat(" ", width-visualWidth)
 }

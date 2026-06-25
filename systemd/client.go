@@ -1,15 +1,55 @@
 package systemd
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/coreos/go-systemd/v22/dbus"
+	godbus "github.com/godbus/dbus/v5"
 )
+
+// DBusUint64Unset is the sentinel uint64 systemd returns when a property is
+// "not set" (uint64 max). It's not a real value — treat it like 0.
+const DBusUint64Unset = ^uint64(0)
+
+// IsUnset reports whether v is missing data (zero or systemd's "unset" sentinel).
+func IsUnset(v uint64) bool { return v == 0 || v == DBusUint64Unset }
+
+// ErrPermissionDenied is returned by action methods when polkit refuses the call
+// without prompting (the typed analogue of "permission denied" string-sniffing).
+var ErrPermissionDenied = errors.New("permission denied")
+
+func mapActionErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var dbusErr godbus.Error
+	if errors.As(err, &dbusErr) {
+		switch dbusErr.Name {
+		case "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired",
+			"org.freedesktop.DBus.Error.AccessDenied":
+			return fmt.Errorf("%w: %v", ErrPermissionDenied, err)
+		}
+	}
+	// Some setups deliver a plain godbus.Error pointer.
+	var dbusErrPtr *godbus.Error
+	if errors.As(err, &dbusErrPtr) && dbusErrPtr != nil {
+		switch dbusErrPtr.Name {
+		case "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired",
+			"org.freedesktop.DBus.Error.AccessDenied":
+			return fmt.Errorf("%w: %v", ErrPermissionDenied, err)
+		}
+	}
+	return err
+}
 
 type Mode int
 
@@ -26,26 +66,27 @@ func (m Mode) String() string {
 }
 
 type ServiceInfo struct {
-	Name                       string
-	Description                string
-	LoadState                  string
-	ActiveState                string
-	SubState                   string
-	UnitFileState              string // enabled, disabled, static, masked, etc.
-	MainPID                    uint32
-	MemoryCurrent              uint64
-	MemoryLimit                uint64
-	CPUUsageNSec               uint64
-	TasksCurrent               uint64
-	TasksMax                   uint64
-	ActiveEnterTimestamp       uint64
-	ActiveExitTimestamp        uint64
-	ExecMainCode               int32
-	ExecMainStatus             int32
-	IPTrafficRxBytes           uint64
-	IPTrafficTxBytes           uint64
-	IOReadBytes                uint64
-	IOWriteBytes               uint64
+	Name                 string
+	Description          string
+	LoadState            string
+	ActiveState          string
+	SubState             string
+	UnitFileState        string // enabled, disabled, static, masked, etc.
+	FragmentPath         string // path to the .service unit file on disk
+	MainPID              uint32
+	ExecMainCode         int32
+	ExecMainStatus       int32
+	MemoryCurrent        uint64
+	MemoryLimit          uint64
+	CPUUsageNSec         uint64
+	TasksCurrent         uint64
+	TasksMax             uint64
+	ActiveEnterTimestamp uint64
+	ActiveExitTimestamp  uint64
+	IPTrafficRxBytes     uint64
+	IPTrafficTxBytes     uint64
+	IOReadBytes          uint64
+	IOWriteBytes         uint64
 }
 
 type Client struct {
@@ -184,6 +225,9 @@ func (c *Client) GetServiceDetails(ctx context.Context, name string) (*ServiceIn
 	if val, ok := props["UnitFileState"].(string); ok {
 		info.UnitFileState = val
 	}
+	if val, ok := props["FragmentPath"].(string); ok {
+		info.FragmentPath = val
+	}
 
 	if val, ok := props["ActiveEnterTimestamp"].(uint64); ok {
 		info.ActiveEnterTimestamp = val
@@ -240,38 +284,79 @@ func (c *Client) GetServiceDetails(ctx context.Context, name string) (*ServiceIn
 func (c *Client) StartService(ctx context.Context, name string) error {
 	ch := make(chan string, 1)
 	_, err := c.conn.StartUnitContext(ctx, name, "replace", ch)
-	if err != nil {
-		return err
-	}
-	return nil
+	return mapActionErr(err)
 }
 
 func (c *Client) StopService(ctx context.Context, name string) error {
 	ch := make(chan string, 1)
 	_, err := c.conn.StopUnitContext(ctx, name, "replace", ch)
-	if err != nil {
-		return err
-	}
-	return nil
+	return mapActionErr(err)
 }
 
 func (c *Client) RestartService(ctx context.Context, name string) error {
 	ch := make(chan string, 1)
 	_, err := c.conn.RestartUnitContext(ctx, name, "replace", ch)
-	if err != nil {
-		return err
-	}
-	return nil
+	return mapActionErr(err)
 }
 
 func (c *Client) EnableService(ctx context.Context, name string) error {
 	_, _, err := c.conn.EnableUnitFilesContext(ctx, []string{name}, false, false)
-	return err
+	return mapActionErr(err)
 }
 
 func (c *Client) DisableService(ctx context.Context, name string) error {
 	_, err := c.conn.DisableUnitFilesContext(ctx, []string{name}, false)
-	return err
+	return mapActionErr(err)
+}
+
+// ReadUnitFile returns the contents of the unit file at path. It refuses paths
+// outside the conventional systemd unit directories so a malformed FragmentPath
+// can't trick us into reading arbitrary files. Returns ("", nil) if path is empty
+// (e.g. for transient or generated units that have no on-disk file).
+func (c *Client) ReadUnitFile(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	clean := filepath.Clean(path)
+	allowed := false
+	for _, prefix := range []string{
+		"/etc/systemd/",
+		"/usr/lib/systemd/",
+		"/lib/systemd/",
+		"/run/systemd/",
+		"/usr/local/lib/systemd/",
+	} {
+		if strings.HasPrefix(clean, prefix) {
+			allowed = true
+			break
+		}
+	}
+	// User units live under XDG dirs inside $HOME. Limit to those two known
+	// roots rather than "anywhere under $HOME" so a hostile FragmentPath can't
+	// trick us into reading e.g. ~/.ssh/id_rsa.
+	if !allowed {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			home = filepath.Clean(home)
+			for _, sub := range []string{
+				filepath.Join(home, ".config", "systemd") + string(os.PathSeparator),
+				filepath.Join(home, ".local", "share", "systemd") + string(os.PathSeparator),
+			} {
+				if strings.HasPrefix(clean, sub) {
+					allowed = true
+					break
+				}
+			}
+		}
+	}
+	if !allowed {
+		return "", fmt.Errorf("refusing to read unit file outside systemd dirs: %s", clean)
+	}
+
+	data, err := os.ReadFile(clean)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // GetLogs fetches the recent logs of a service using journalctl.
@@ -288,4 +373,50 @@ func (c *Client) GetLogs(ctx context.Context, name string, limit int) (string, e
 		return "", fmt.Errorf("journalctl failed: %w (output: %s)", err, string(output))
 	}
 	return string(output), nil
+}
+
+// FollowLogs starts `journalctl -fn <limit>` for the given unit and emits each
+// stdout line on the returned channel. The channel is closed when ctx is canceled
+// or the process exits. Errors during streaming are surfaced as a synthetic line
+// prefixed with "[follow error]" rather than as a separate channel, to keep the
+// caller's append-to-buffer loop uniform.
+func (c *Client) FollowLogs(ctx context.Context, name string, limit int) (<-chan string, error) {
+	args := []string{}
+	if c.mode == UserMode {
+		args = append(args, "--user")
+	}
+	args = append(args, "-u", name, "-n", strconv.Itoa(limit), "-f", "--no-pager")
+
+	cmd := exec.CommandContext(ctx, "journalctl", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("journalctl pipe: %w", err)
+	}
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("journalctl start: %w", err)
+	}
+
+	out := make(chan string, 64)
+	go func() {
+		defer close(out)
+		defer func() { _ = cmd.Wait() }()
+		sc := bufio.NewScanner(stdout)
+		// Allow long log lines (default scanner buffer is 64 KiB).
+		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for sc.Scan() {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- sc.Text():
+			}
+		}
+		if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
+			select {
+			case out <- fmt.Sprintf("[follow error] %v", err):
+			default:
+			}
+		}
+	}()
+	return out, nil
 }

@@ -3,20 +3,45 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/aymanhs/sys-tui/systemd"
+	"github.com/aymanhs/jeeves/systemd"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
+
+// logLineChoices is the cycle of "last N lines" sizes the user can toggle through with [ / ].
+var logLineChoices = []int{100, 250, 500, 1000, 2500}
+
+// actionPastTenseTable hard-codes the past tense for each action verb. Hand-rolled
+// "+ed"/"+d" suffixing gave "stoped" — past-tense English doesn't suffix-rule cleanly.
+var actionPastTenseTable = map[string]string{
+	"start":   "started",
+	"stop":    "stopped",
+	"restart": "restarted",
+	"enable":  "enabled",
+	"disable": "disabled",
+	"mask":    "masked",
+	"unmask":  "unmasked",
+}
+
+func actionPastTense(action string) string {
+	if p, ok := actionPastTenseTable[action]; ok {
+		return p
+	}
+	return action + "ed"
+}
 
 type viewType int
 
 const (
 	listView viewType = iota
 	detailView
+	unitFileView
 )
 
 type showMode int
@@ -24,7 +49,43 @@ type showMode int
 const (
 	showAll showMode = iota
 	showRunning
+	showFailed
+	showModeCount // sentinel — keep last for modulo cycling
 )
+
+func (s showMode) String() string {
+	switch s {
+	case showRunning:
+		return "Running"
+	case showFailed:
+		return "Failed"
+	default:
+		return "All"
+	}
+}
+
+type sortMode int
+
+const (
+	sortByName sortMode = iota
+	sortByState
+	sortByMemory
+	sortByPID
+	sortModeCount
+)
+
+func (s sortMode) String() string {
+	switch s {
+	case sortByState:
+		return "state"
+	case sortByMemory:
+		return "memory"
+	case sortByPID:
+		return "PID"
+	default:
+		return "name"
+	}
+}
 
 type focusSection int
 
@@ -40,9 +101,10 @@ type servicesFetchedMsg struct {
 }
 
 type detailsFetchedMsg struct {
-	details *systemd.ServiceInfo
-	logs    string
-	err     error
+	details  *systemd.ServiceInfo
+	logs     string
+	unitFile string
+	err      error
 }
 
 type actionCompletedMsg struct {
@@ -55,6 +117,30 @@ type statusTimeoutMsg struct {
 	id uint32
 }
 
+// liveTickMsg fires every refreshTickInterval while the detail view is open and
+// triggers a lightweight metrics-only refetch (no logs, no unit file).
+type liveTickMsg struct {
+	generation uint64
+}
+
+const refreshTickInterval = 2 * time.Second
+
+// metricsFetchedMsg carries refreshed memory/CPU/Tasks/timestamps for the active
+// service — strictly less than detailsFetchedMsg, used by the live ticker.
+type metricsFetchedMsg struct {
+	name string
+	info *systemd.ServiceInfo
+	err  error
+}
+
+// logsAppendedMsg arrives from the FollowLogs goroutine with a chunk of new lines.
+// generation lets us discard messages from a previous follow session.
+type logsAppendedMsg struct {
+	generation uint64
+	lines      string
+	closed     bool // true when the journalctl process ended
+}
+
 // Model represents the bubbletea application state.
 type Model struct {
 	client           *systemd.Client
@@ -63,19 +149,45 @@ type Model struct {
 	selectedIndex    int
 	scrollOffset     int
 
-	// Search/Filter
+	// Search/Filter/Sort
 	searchInput textinput.Model
 	filtering   bool
 	filterQuery string
+	sortMode    sortMode
+
+	// Confirmation prompt for destructive actions (stop/restart/disable).
+	confirmAction      string // verb being confirmed ("" when not confirming)
+	confirmServiceName string
+
+	// Live ticker — re-fetches details every refreshTickInterval when on the
+	// detail view, so memory/CPU/Tasks update without manual R.
+	tickGeneration uint64
+
+	// Follow-logs (F3): a background tail -f pumps lines into followLogsCh, the
+	// model appends them to m.logs as logsAppendedMsg events arrive.
+	followLogs       bool
+	followCancel     context.CancelFunc
+	followGeneration uint64 // bumped on stop so stale msgs are ignored
+	followCh         <-chan string
 
 	// Navigation & Views
-	currentView           viewType
-	showMode              showMode
-	detailFocusedSection  focusSection
-	activeDetail          *systemd.ServiceInfo
-	logs                  string
-	logViewport           viewport.Model
-	logWrap               bool
+	currentView          viewType
+	showMode             showMode
+	detailFocusedSection focusSection
+	activeDetail         *systemd.ServiceInfo
+	logs                 string // raw, unwrapped log text most recently fetched
+	logViewport          viewport.Model
+	logWrap              bool
+	logLineLimitIdx      int // index into logLineChoices
+	logRawLineCount      int // number of source log lines actually returned
+
+	// Unit file contents (shown on its own full-screen view via the `u` key).
+	unitFile         string
+	unitFileViewport viewport.Model
+
+	// True until the first services list arrives — drives the startup "Loading..."
+	// message in place of "no services found".
+	initialLoad bool
 
 	// Status messages
 	statusMsg   string
@@ -98,10 +210,13 @@ func NewModel(client *systemd.Client) Model {
 	ti.Prompt = " 🔍 "
 	ti.PromptStyle = SearchPromptStyle
 	ti.TextStyle = SearchInputStyle
-	ti.CharLimit = 50
+	ti.CharLimit = 128 // service names go up to ~70 chars; leave room for typos + paste
 
 	vp := viewport.New(0, 0)
 	vp.KeyMap = viewport.DefaultKeyMap()
+
+	uvp := viewport.New(0, 0)
+	uvp.KeyMap = viewport.DefaultKeyMap()
 
 	return Model{
 		client:               client,
@@ -110,7 +225,10 @@ func NewModel(client *systemd.Client) Model {
 		showMode:             showAll,
 		detailFocusedSection: focusInfo,
 		logViewport:          vp,
+		unitFileViewport:     uvp,
 		logWrap:              true,
+		logLineLimitIdx:      1, // default 250
+		initialLoad:          true,
 	}
 }
 
@@ -133,6 +251,29 @@ func (m *Model) fetchServicesCmd() tea.Cmd {
 	}
 }
 
+// scheduleTickCmd returns a tea.Cmd that fires liveTickMsg after the configured
+// interval. We use generation so a stale tick from a previous detail-view session
+// (after the user went back to the list and reopened a different service) is
+// ignored.
+func (m *Model) scheduleTickCmd() tea.Cmd {
+	gen := m.tickGeneration
+	return tea.Tick(refreshTickInterval, func(time.Time) tea.Msg {
+		return liveTickMsg{generation: gen}
+	})
+}
+
+// fetchMetricsCmd is the lightweight refresh that fires on every tick. It only
+// hits D-Bus (no journalctl, no file read), so it stays cheap enough to run
+// every few seconds.
+func (m *Model) fetchMetricsCmd(name string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		info, err := m.client.GetServiceDetails(ctx, name)
+		return metricsFetchedMsg{name: name, info: info, err: err}
+	}
+}
+
 func (m *Model) fetchDetailsCmd(name string) tea.Cmd {
 	m.loading = true
 	return func() tea.Msg {
@@ -144,18 +285,126 @@ func (m *Model) fetchDetailsCmd(name string) tea.Cmd {
 			return detailsFetchedMsg{err: err}
 		}
 
-		// Fetch 150 lines of logs
-		logs, err := m.client.GetLogs(ctx, name, 150)
-		if err != nil {
-			// If logs fails, we still return the details but with empty logs or an error notice
-			return detailsFetchedMsg{
-				details: details,
-				logs:    fmt.Sprintf("Failed to fetch logs: %v", err),
-			}
+		// Fetch the user-selected number of lines (default 250)
+		logs, logsErr := m.client.GetLogs(ctx, name, m.logLineLimit())
+		logsStr := logs
+		if logsErr != nil {
+			logsStr = fmt.Sprintf("Failed to fetch logs: %v", logsErr)
 		}
 
-		return detailsFetchedMsg{details: details, logs: logs}
+		// Read the unit file body. Failures here are non-fatal — many units have no
+		// FragmentPath (transient, generated), so we just show a friendly message.
+		var unitFile string
+		if details.FragmentPath == "" {
+			unitFile = "(no unit file on disk — transient or generated unit)"
+		} else if body, err := m.client.ReadUnitFile(details.FragmentPath); err != nil {
+			unitFile = fmt.Sprintf("Failed to read %s: %v", details.FragmentPath, err)
+		} else {
+			unitFile = body
+		}
+
+		return detailsFetchedMsg{details: details, logs: logsStr, unitFile: unitFile}
 	}
+}
+
+// destructiveActions are the verbs that require y/N confirmation. Pressing the
+// key once arms a banner; pressing y/Y/enter confirms; anything else cancels.
+var destructiveActions = map[string]bool{
+	"stop":    true,
+	"restart": true,
+	"disable": true,
+	"mask":    true,
+}
+
+// requestAction either fires the action immediately or arms a confirmation banner
+// for destructive verbs. Returns the tea.Cmd to enqueue.
+func (m *Model) requestAction(action, name string) tea.Cmd {
+	if destructiveActions[action] {
+		m.confirmAction = action
+		m.confirmServiceName = name
+		// No status timeout — the banner stays until the user answers.
+		m.statusMsg = fmt.Sprintf("Confirm %s %s? [y/N]", action, name)
+		m.statusIsErr = false
+		m.statusMsgID++ // invalidate any in-flight timeout
+		return nil
+	}
+	return m.runActionCmd(action, name)
+}
+
+// startFollowLogsCmd kicks off `journalctl -fn N` for the active service. The
+// channel is stashed on the model so handler-level continuations can re-arm the
+// wait without re-piping every closure. Returns the first wait cmd.
+func (m *Model) startFollowLogsCmd(name string) tea.Cmd {
+	m.stopFollowLogs() // make sure no previous tail is still running
+	m.followGeneration++
+	gen := m.followGeneration
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ch, err := m.client.FollowLogs(ctx, name, m.logLineLimit())
+	if err != nil {
+		cancel()
+		return m.triggerStatus(fmt.Sprintf("Follow failed: %v", err), true)
+	}
+	m.followCancel = cancel
+	m.followLogs = true
+	m.followCh = ch
+	return waitFollowCmd(gen, ch)
+}
+
+// waitFollowCmd is the continuation primitive: blocks on the channel for the next
+// line, returns it as a logsAppendedMsg, and the message handler enqueues another
+// waitFollowCmd to keep the loop going.
+func waitFollowCmd(gen uint64, ch <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return logsAppendedMsg{generation: gen, closed: true}
+		}
+		// Batch any immediately-available lines into the same message so a noisy
+		// service doesn't blow up the message queue with 1000s of tiny msgs.
+		batch := line
+		for done := false; !done; {
+			select {
+			case more, stillOpen := <-ch:
+				if !stillOpen {
+					return logsAppendedMsg{generation: gen, lines: batch, closed: true}
+				}
+				batch += "\n" + more
+			default:
+				done = true
+			}
+		}
+		return logsAppendedMsg{generation: gen, lines: batch}
+	}
+}
+
+// stopFollowLogs cancels the running tail goroutine (if any). Safe to call
+// multiple times; bumping the generation prevents stale msgs from being
+// processed.
+func (m *Model) stopFollowLogs() {
+	if m.followCancel != nil {
+		m.followCancel()
+		m.followCancel = nil
+	}
+	m.followLogs = false
+	m.followCh = nil
+	m.followGeneration++
+}
+
+// trimLeadingLines drops the first n lines of s. Used to cap the in-memory log
+// buffer when follow-mode is running.
+func trimLeadingLines(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	for i := 0; i < n; i++ {
+		idx := strings.IndexByte(s, '\n')
+		if idx < 0 {
+			return ""
+		}
+		s = s[idx+1:]
+	}
+	return s
 }
 
 func (m *Model) runActionCmd(action, name string) tea.Cmd {
@@ -206,6 +455,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case servicesFetchedMsg:
 		m.loading = false
+		m.initialLoad = false
 		if msg.err != nil {
 			m.err = msg.err
 			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Fetch failed: %v", msg.err), true))
@@ -221,8 +471,92 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.activeDetail = msg.details
 			m.logs = msg.logs
-			m.logViewport.SetContent(m.logs)
+			m.unitFile = msg.unitFile
+			m.logRawLineCount = countLines(m.logs)
+			m.refreshLogViewport()
 			m.logViewport.GotoBottom()
+			m.refreshUnitFileViewport()
+			m.unitFileViewport.GotoTop()
+			// Kick off the live ticker for memory/CPU updates.
+			if m.currentView == detailView || m.currentView == unitFileView {
+				m.tickGeneration++
+				cmds = append(cmds, m.scheduleTickCmd())
+			}
+		}
+
+	case metricsFetchedMsg:
+		// Drop stale metrics from a previous service or after a back-to-list.
+		if m.activeDetail == nil || msg.name != m.activeDetail.Name {
+			break
+		}
+		if msg.err == nil && msg.info != nil {
+			// Splice in only the live-updating fields; leave Description, Logs,
+			// FragmentPath etc. alone.
+			d := m.activeDetail
+			d.ActiveState = msg.info.ActiveState
+			d.SubState = msg.info.SubState
+			d.MainPID = msg.info.MainPID
+			d.MemoryCurrent = msg.info.MemoryCurrent
+			d.CPUUsageNSec = msg.info.CPUUsageNSec
+			d.TasksCurrent = msg.info.TasksCurrent
+			d.IPTrafficRxBytes = msg.info.IPTrafficRxBytes
+			d.IPTrafficTxBytes = msg.info.IPTrafficTxBytes
+			d.IOReadBytes = msg.info.IOReadBytes
+			d.IOWriteBytes = msg.info.IOWriteBytes
+			d.ActiveEnterTimestamp = msg.info.ActiveEnterTimestamp
+			d.ActiveExitTimestamp = msg.info.ActiveExitTimestamp
+		}
+
+	case liveTickMsg:
+		// Ignore ticks from a previous detail-view session.
+		if msg.generation != m.tickGeneration {
+			break
+		}
+		if (m.currentView == detailView || m.currentView == unitFileView) && m.activeDetail != nil {
+			cmds = append(cmds, m.fetchMetricsCmd(m.activeDetail.Name))
+			cmds = append(cmds, m.scheduleTickCmd())
+		}
+
+	case logsAppendedMsg:
+		if msg.generation != m.followGeneration || !m.followLogs {
+			break
+		}
+		if msg.lines != "" {
+			if m.logs == "" {
+				m.logs = msg.lines
+			} else {
+				m.logs += "\n" + msg.lines
+			}
+			m.logRawLineCount = countLines(m.logs)
+			// Cap the in-memory buffer at 10× the visible limit so a runaway
+			// process can't grow the model forever.
+			maxBuf := m.logLineLimit() * 10
+			if maxBuf < 500 {
+				maxBuf = 500
+			}
+			if m.logRawLineCount > maxBuf {
+				m.logs = trimLeadingLines(m.logs, m.logRawLineCount-maxBuf)
+				m.logRawLineCount = countLines(m.logs)
+			}
+			// Auto-scroll only when the user was already at the bottom — preserve
+			// their scroll position if they're reading historical lines.
+			wasAtBottom := m.logViewport.AtBottom()
+			m.refreshLogViewport()
+			if wasAtBottom {
+				m.logViewport.GotoBottom()
+			}
+		}
+		if msg.closed {
+			m.followLogs = false
+			if m.followCancel != nil {
+				m.followCancel()
+				m.followCancel = nil
+			}
+			m.followCh = nil
+			cmds = append(cmds, m.triggerStatus("Follow ended", false))
+		} else if m.followCh != nil {
+			// Re-arm: wait for the next batch.
+			cmds = append(cmds, waitFollowCmd(m.followGeneration, m.followCh))
 		}
 
 	case actionCompletedMsg:
@@ -235,13 +569,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Error running %s on %s: %s", msg.action, msg.serviceName, errStr), true))
 		} else {
-			actionPast := msg.action + "ed"
-			if strings.HasSuffix(msg.action, "e") {
-				actionPast = msg.action + "d"
-			}
-			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Successfully %s %s", actionPast, msg.serviceName), false))
-			// Refresh current state
-			if m.currentView == detailView && m.activeDetail != nil && m.activeDetail.Name == msg.serviceName {
+			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Successfully %s %s", actionPastTense(msg.action), msg.serviceName), false))
+			// Refresh the view the user is currently looking at. The detail and
+			// unit-file views both rely on m.activeDetail being current.
+			if m.activeDetail != nil && m.activeDetail.Name == msg.serviceName &&
+				(m.currentView == detailView || m.currentView == unitFileView) {
 				cmds = append(cmds, m.fetchDetailsCmd(msg.serviceName))
 			} else {
 				cmds = append(cmds, m.fetchServicesCmd())
@@ -254,10 +586,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
-		// Global keys
+		// Global keys. `q` only quits when not typing into the filter input —
+		// otherwise it would swallow the letter mid-search.
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "q":
+			if !m.filtering && m.confirmAction == "" {
+				return m, tea.Quit
+			}
+		}
+
+		// If a confirmation banner is up, every key answers it. y/Y/enter fires
+		// the pending action; any other key cancels and falls through to nothing.
+		if m.confirmAction != "" {
+			action, name := m.confirmAction, m.confirmServiceName
+			m.confirmAction, m.confirmServiceName = "", ""
+			m.statusMsg = ""
+			switch msg.String() {
+			case "y", "Y", "enter":
+				return m, m.runActionCmd(action, name)
+			}
+			cmds = append(cmds, m.triggerStatus("Canceled", false))
+			return m, tea.Batch(cmds...)
 		}
 
 		if m.filtering {
@@ -277,80 +628,301 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// View-specific keys
-		if m.currentView == listView {
+		switch m.currentView {
+		case listView:
 			cmds = append(cmds, m.handleListKey(msg))
-		} else {
+		case detailView:
 			cmds = append(cmds, m.handleDetailKey(msg))
+		case unitFileView:
+			cmds = append(cmds, m.handleUnitFileKey(msg))
 		}
 	}
 
 	// Adjust scroll offset for ListView
-	maxRows := m.height - 12
-	if maxRows < 3 {
-		maxRows = 3
-	}
-	m.adjustScrollOffset(maxRows)
+	m.adjustScrollOffset(m.listMaxRows())
 
 	return m, tea.Batch(cmds...)
+}
+
+// Vertical budget of everything around the panels in the detail view, in rows:
+//
+//	2  page header (title row + blank)
+//	1  newline after the panels block
+//	2  status banner area (banner with margin, or "\n\n" placeholder)
+//	4  footer (MarginTop(1) + BorderTop(1) + PaddingTop(1) + 1 content row)
+//
+// = 9. The panels' OUTER height (border included) is therefore m.height - 9.
+const detailChromeRows = 9
+
+// detailLayout returns the outer width/height of each panel box (info + log) along
+// with the inner viewport size for the log box. Kept in one place so renderer + model
+// agree exactly on geometry — otherwise borders overflow off the bottom of the screen
+// and the page header scrolls off the top.
+//
+// Returned dimensions are OUTER (border-inclusive). Callers pass `outer - 2` to
+// lipgloss's .Width()/.Height() because those set the inner content size.
+func (m Model) detailLayout() (infoBoxW, infoBoxH, logBoxW, logBoxH, vpW, vpH int) {
+	panelsOuterH := m.height - detailChromeRows
+	if panelsOuterH < 8 {
+		panelsOuterH = 8
+	}
+
+	if m.width >= 100 {
+		// Side-by-side: fixed-width info column, log column gets the rest.
+		infoBoxW = 45
+		logBoxW = m.width - infoBoxW - 2 // -2 for DocStyle frame / gap
+		if logBoxW < 24 {
+			logBoxW = 24
+		}
+		infoBoxH = panelsOuterH
+		logBoxH = panelsOuterH
+	} else {
+		// Stacked: both panels full width, split the vertical budget.
+		infoBoxW = m.width - 2
+		if infoBoxW < 24 {
+			infoBoxW = 24
+		}
+		logBoxW = infoBoxW
+		infoBoxH = panelsOuterH / 2
+		logBoxH = panelsOuterH - infoBoxH
+	}
+
+	// BoxStyle = rounded border (2 cols / 2 rows) + Padding(0,1) (2 cols). Inside the
+	// log box we also reserve 1 row for the panel header and 1 row for the meta row.
+	vpW = logBoxW - 4 // 2 border + 2 padding
+	if vpW < 10 {
+		vpW = 10
+	}
+	vpH = logBoxH - 2 /* border */ - 2 /* header + meta rows */
+	if vpH < 3 {
+		vpH = 3
+	}
+	return
 }
 
 func (m *Model) recalculateViewportSize() {
 	if m.width == 0 || m.height == 0 {
 		return
 	}
-	// Dynamic size calculation for detail view panels
-	mainContentHeight := m.height - 5
-	if mainContentHeight < 6 {
-		mainContentHeight = 6
+	_, _, _, _, vpW, vpH := m.detailLayout()
+	if vpW != m.logViewport.Width || vpH != m.logViewport.Height {
+		m.logViewport.Width = vpW
+		m.logViewport.Height = vpH
+		m.refreshLogViewport()
 	}
 
-	if m.width >= 100 {
-		// Side-by-side
-		m.logViewport.Width = m.width - 45 - 6
-		m.logViewport.Height = mainContentHeight - 4 // 2 borders, 2 headers inside box
-	} else {
-		// Stacked
-		infoBoxHeight := mainContentHeight / 2
-		logBoxHeight := mainContentHeight - infoBoxHeight
-		m.logViewport.Width = m.width - 6
-		m.logViewport.Height = logBoxHeight - 4 // 2 borders, 2 headers inside box
+	uw, uh := m.unitFileViewSize()
+	if uw != m.unitFileViewport.Width || uh != m.unitFileViewport.Height {
+		m.unitFileViewport.Width = uw
+		m.unitFileViewport.Height = uh
+		m.refreshUnitFileViewport()
 	}
 }
 
-func (m *Model) filterServices() {
-	if m.filterQuery == "" {
-		m.filteredServices = m.services
+// listMaxRows is the number of service rows the list view can show. Used by both
+// the renderer and the scroll-offset clamp so the two never drift apart.
+//
+//	2 page header + 2 search bar + 2 mode row + 2 table header rows
+//	+ 2 status banner + 4 footer = 14 rows of chrome, but the existing
+//	tuning used 12 (the renderer was rendering an extra blank gap).
+//	Keep the empirically-correct value to preserve current behavior.
+func (m Model) listMaxRows() int {
+	r := m.height - 12
+	if r < 3 {
+		r = 3
+	}
+	return r
+}
+
+// unitFileViewSize returns the (width, height) of the scrollable unit-file viewport
+// on its own full-screen view. The view chrome above/below it is fixed at:
+//
+//	2 page header (title + blank)
+//	1 path subtitle row
+//	1 blank
+//	4 footer (margin+border+padding+content)
+//
+// = 8 rows.
+const unitFileChromeRows = 8
+
+func (m Model) unitFileViewSize() (w, h int) {
+	w = m.width - 2 // -2 for DocStyle frame
+	if w < 20 {
+		w = 20
+	}
+	h = m.height - unitFileChromeRows
+	if h < 4 {
+		h = 4
+	}
+	return
+}
+
+// refreshUnitFileViewport hard-wraps the cached unit file to the viewport width so
+// long lines don't spill, then pushes the result into the viewport. No styling on
+// the body — keeps mouse copy/paste clean.
+func (m *Model) refreshUnitFileViewport() {
+	if m.unitFile == "" {
+		m.unitFileViewport.SetContent("")
+		return
+	}
+	width := m.unitFileViewport.Width
+	if width < 1 {
+		width = 1
+	}
+	m.unitFileViewport.SetContent(ansi.Hardwrap(m.unitFile, width, false))
+}
+
+// refreshLogViewport re-applies the current wrap setting + viewport width to the cached
+// raw logs and pushes the result into the viewport. Call after width changes, wrap toggles,
+// or new log content arrives.
+func (m *Model) refreshLogViewport() {
+	if m.logs == "" {
+		m.logViewport.SetContent("")
+		return
+	}
+	width := m.logViewport.Width
+	if width < 1 {
+		width = 1
+	}
+	var content string
+	if m.logWrap {
+		// ansi.Wrap word-wraps at spaces, falling back to hard-wrap when a token is
+		// longer than the column. Preserves ANSI sequences across line breaks.
+		content = ansi.Wrap(m.logs, width, "")
 	} else {
-		m.filteredServices = nil
+		// Truncate every line so nothing leaks past the right border of the box.
+		content = truncateLines(m.logs, width)
+	}
+	m.logViewport.SetContent(content)
+}
+
+// logLineLimit is the current "tail -n" the user has selected.
+func (m Model) logLineLimit() int {
+	if m.logLineLimitIdx < 0 || m.logLineLimitIdx >= len(logLineChoices) {
+		return logLineChoices[0]
+	}
+	return logLineChoices[m.logLineLimitIdx]
+}
+
+// countLines returns the number of newline-terminated lines in s (with a tolerant
+// last-line-without-\n).
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		n++
+	}
+	return n
+}
+
+// truncateLines hard-truncates each line of s to fit visually within width cells. Used
+// when wrap is OFF so overly long lines don't spill the box.
+func truncateLines(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i, line := range strings.Split(s, "\n") {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		// ansi.Truncate keeps ANSI sequences intact and respects cell width.
+		b.WriteString(ansi.Truncate(line, width, ""))
+	}
+	return b.String()
+}
+
+func (m *Model) filterServices() {
+	// 1. Text filter
+	var working []systemd.ServiceInfo
+	if m.filterQuery == "" {
+		working = append(working, m.services...)
+	} else {
 		q := strings.ToLower(m.filterQuery)
 		for _, s := range m.services {
-			if strings.Contains(strings.ToLower(s.Name), q) || strings.Contains(strings.ToLower(s.Description), q) {
-				m.filteredServices = append(m.filteredServices, s)
+			if strings.Contains(strings.ToLower(s.Name), q) ||
+				strings.Contains(strings.ToLower(s.Description), q) {
+				working = append(working, s)
 			}
 		}
 	}
 
-	// Apply view filter (all/running)
-	var final []systemd.ServiceInfo
-	for _, s := range m.filteredServices {
+	// 2. Mode filter
+	final := working[:0]
+	for _, s := range working {
 		switch m.showMode {
 		case showRunning:
 			if s.ActiveState == "active" && s.SubState == "running" {
+				final = append(final, s)
+			}
+		case showFailed:
+			if s.ActiveState == "failed" {
 				final = append(final, s)
 			}
 		default:
 			final = append(final, s)
 		}
 	}
+
+	// 3. Sort
+	sortServices(final, m.sortMode)
 	m.filteredServices = final
 
-	// Bounds checking for selectedIndex
+	// 4. Bounds checking for selectedIndex
 	if m.selectedIndex >= len(m.filteredServices) {
 		m.selectedIndex = len(m.filteredServices) - 1
 	}
 	if m.selectedIndex < 0 {
 		m.selectedIndex = 0
 	}
+}
+
+// sortServices sorts in place by the chosen key. Name is the tiebreaker for all
+// modes so the order is deterministic across re-fetches.
+func sortServices(svcs []systemd.ServiceInfo, mode sortMode) {
+	// activeRank orders active > activating/deactivating > inactive > failed > rest.
+	activeRank := func(s systemd.ServiceInfo) int {
+		switch s.ActiveState {
+		case "failed":
+			return 0 // surface failures first
+		case "active":
+			return 1
+		case "activating", "deactivating", "reloading":
+			return 2
+		case "inactive":
+			return 3
+		default:
+			return 4
+		}
+	}
+	sort.SliceStable(svcs, func(i, j int) bool {
+		a, b := svcs[i], svcs[j]
+		switch mode {
+		case sortByState:
+			if ra, rb := activeRank(a), activeRank(b); ra != rb {
+				return ra < rb
+			}
+		case sortByMemory:
+			am, bm := a.MemoryCurrent, b.MemoryCurrent
+			if systemd.IsUnset(am) {
+				am = 0
+			}
+			if systemd.IsUnset(bm) {
+				bm = 0
+			}
+			if am != bm {
+				return am > bm // largest first
+			}
+		case sortByPID:
+			if a.MainPID != b.MainPID {
+				return a.MainPID > b.MainPID
+			}
+		}
+		return a.Name < b.Name
+	})
 }
 
 func (m *Model) adjustScrollOffset(maxRows int) {
@@ -387,9 +959,12 @@ func (m Model) View() string {
 		return fmt.Sprintf("\n  Fatal Error: %v\n  Press Ctrl+C to quit.\n", m.err)
 	}
 
-	if m.currentView == listView {
+	switch m.currentView {
+	case listView:
 		return m.renderListView()
+	case unitFileView:
+		return m.renderUnitFileView()
+	default:
+		return m.renderDetailView()
 	}
-	return m.renderDetailView()
 }
-

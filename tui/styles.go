@@ -1,6 +1,31 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+// RenderFooter formats a flat list of key/desc pairs as a single footer line,
+// styled with HelpKeyStyle / HelpDescStyle and padded to the full screen width.
+// keys must have even length: [key1, desc1, key2, desc2, ...].
+func RenderFooter(keys []string, screenWidth int) string {
+	if len(keys)%2 != 0 {
+		// Drop the trailing odd entry rather than crashing on a typo.
+		keys = keys[:len(keys)-1]
+	}
+	items := make([]string, 0, len(keys)/2)
+	for i := 0; i < len(keys); i += 2 {
+		items = append(items, fmt.Sprintf("%s %s",
+			HelpKeyStyle.Render(keys[i]), HelpDescStyle.Render(keys[i+1])))
+	}
+	w := screenWidth - 2
+	if w < 20 {
+		w = 20
+	}
+	return FooterStyle.Width(w).Render(strings.Join(items, "  •  "))
+}
 
 // Colors
 var (
@@ -111,6 +136,11 @@ var (
 			PaddingTop(1).
 			MarginTop(1)
 
+	// Log panel meta row (line counts, wrap state, scroll position).
+	LogMetaStyle = lipgloss.NewStyle().
+			Foreground(ColorGray).
+			Italic(true)
+
 	HelpKeyStyle = lipgloss.NewStyle().
 			Foreground(ColorSecondary).
 			Bold(true)
@@ -146,4 +176,15 @@ var (
 
 	SearchInputStyle = lipgloss.NewStyle().
 				Foreground(ColorText)
+
+	// Active filter chrome (shown while the user is typing into the filter).
+	SearchActiveLabel = lipgloss.NewStyle().
+				Background(ColorPrimary).
+				Foreground(lipgloss.Color("#ffffff")).
+				Bold(true)
+
+	SearchActiveBox = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColorPrimary).
+			Padding(0, 1)
 )
