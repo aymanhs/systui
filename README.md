@@ -63,12 +63,17 @@ need eight terminal windows and a copy-paste pipeline through `awk` to find out.
 Pick whichever is easiest:
 
 **Prebuilt binary** (no Go required) — grab the right tarball for your
-architecture from the [Releases page](https://github.com/aymanhs/jeeves/releases/latest).
-Linux `amd64`, `arm64`, and `arm` (Pi 2/3/4/5) are all there.
+architecture from the [Releases page](https://github.com/aymanhs/jeeves/releases/latest):
+
+| Tarball | Use this if your `uname -m` is… | Typical hardware |
+|---|---|---|
+| `jeeves-linux-amd64.tar.gz` | `x86_64` | Servers, desktops |
+| `jeeves-linux-arm64.tar.gz` | `aarch64` | Pi 3/4/5 on 64-bit Raspberry Pi OS, AWS Graviton |
+| `jeeves-linux-armv7.tar.gz` | `armv7l` | Pi 2/3/4 on 32-bit Raspberry Pi OS |
 
 ```bash
-# Example: Pi 3B+ / 4 / 5
-curl -L https://github.com/aymanhs/jeeves/releases/latest/download/jeeves-linux-arm64.tar.gz \
+# Example: 32-bit Raspberry Pi OS (Pi 3B+ default)
+curl -L https://github.com/aymanhs/jeeves/releases/latest/download/jeeves-linux-armv7.tar.gz \
   | tar xz
 sudo install jeeves /usr/local/bin/
 ```
