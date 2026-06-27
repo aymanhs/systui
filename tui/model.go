@@ -100,6 +100,22 @@ type servicesFetchedMsg struct {
 	err      error
 }
 
+// loadedServicesFetchedMsg carries the cheap "already-loaded units" half of
+// the initial fetch. It paints the list immediately so the user isn't staring
+// at "Loading..." while the slower on-disk scan runs.
+type loadedServicesFetchedMsg struct {
+	services []systemd.ServiceInfo
+	err      error
+}
+
+// unitFilesFetchedMsg carries the slower on-disk unit-file scan. It merges
+// enablement state into the already-displayed list and appends installed-
+// but-not-loaded services.
+type unitFilesFetchedMsg struct {
+	files []systemd.ServiceInfo
+	err   error
+}
+
 type detailsFetchedMsg struct {
 	details  *systemd.ServiceInfo
 	logs     string
@@ -141,13 +157,38 @@ type logsAppendedMsg struct {
 	closed     bool // true when the journalctl process ended
 }
 
+// connectedMsg is delivered when the D-Bus connection has been established (or
+// failed). Connection is deferred into the model's Init command so the
+// alt-screen + chrome paint *before* polkit/sudo handshakes block.
+type connectedMsg struct {
+	client *systemd.Client
+	err    error
+}
+
+// cachedServicesMsg carries the optimistic paint from the on-disk service
+// cache (see systemd/cache.go). Lands before connectedMsg so the user sees a
+// real list as soon as the alt-screen comes up; the live fetch overwrites it
+// when it returns.
+type cachedServicesMsg struct {
+	services []systemd.ServiceInfo
+	mode     systemd.Mode
+}
+
 // Model represents the bubbletea application state.
 type Model struct {
 	client           *systemd.Client
+	requestedMode    *systemd.Mode // honored when client is connected lazily
+	useCache         bool          // false → skip both cache read on startup and cache write after fetch
 	services         []systemd.ServiceInfo
 	filteredServices []systemd.ServiceInfo
 	selectedIndex    int
 	scrollOffset     int
+
+	// True while we're showing cached data and the live fetch hasn't returned
+	// yet — used to dim the "Bus:" header into a "(cached)" hint so the user
+	// can tell the on-screen state may be a few seconds out of date.
+	showingCached bool
+	cachedMode    systemd.Mode // bus the displayed cache was saved against
 
 	// Search/Filter/Sort
 	searchInput textinput.Model
@@ -198,13 +239,22 @@ type Model struct {
 	width  int
 	height int
 
-	// Loading state
-	loading bool
-	err     error
+	// Loading state. `loading` flips off when both halves of the two-phase
+	// fetch have arrived (loaded units + unit-file scan); `pendingFetches`
+	// counts them down.
+	loading        bool
+	pendingFetches int
+	err            error
 }
 
-// NewModel initializes the Bubble Tea model with the systemd client.
-func NewModel(client *systemd.Client) Model {
+// NewModel initializes the Bubble Tea model. The D-Bus connection itself is
+// deferred to Init so the alt-screen and chrome render before any blocking
+// systemd/polkit work.
+//
+// useCache controls the optimistic-paint cache (see systemd/cache.go). When
+// false, no cache file is read on startup and no cache is written after the
+// fetch completes — wired up to the --no-cache CLI flag.
+func NewModel(mode *systemd.Mode, useCache bool) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Type to filter services..."
 	ti.Prompt = " 🔍 "
@@ -219,7 +269,8 @@ func NewModel(client *systemd.Client) Model {
 	uvp.KeyMap = viewport.DefaultKeyMap()
 
 	return Model{
-		client:               client,
+		requestedMode:        mode,
+		useCache:             useCache,
 		searchInput:          ti,
 		currentView:          listView,
 		showMode:             showAll,
@@ -229,25 +280,101 @@ func NewModel(client *systemd.Client) Model {
 		logWrap:              true,
 		logLineLimitIdx:      1, // default 250
 		initialLoad:          true,
+		loading:              true, // chrome shows "Loading..." until connect+fetch land
 	}
 }
 
-// Init triggers initial loading commands.
+// Init triggers the lazy D-Bus connection. The first fetch is enqueued from
+// the connectedMsg handler so we don't try to call into a nil client.
+//
+// In parallel we kick off a cache-load cmd: if we ran recently against the
+// same bus we'll paint the previous service list as soon as the alt-screen
+// comes up, so the user sees real data instead of "Loading services..."
+// while the live ListUnits round-trip (~1s on a Pi 3B+) is in flight.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		textinput.Blink,
-		m.fetchServicesCmd(),
-	)
+	cmds := []tea.Cmd{textinput.Blink, connectCmd(m.requestedMode)}
+	if m.useCache {
+		cmds = append(cmds, loadCacheCmd(m.requestedMode))
+	}
+	return tea.Batch(cmds...)
+}
+
+// connectCmd opens the systemd D-Bus connection off the main render loop. On
+// a Pi 3B+ under sudo this can take a noticeable fraction of a second; doing
+// it here means the alt-screen + chrome paint first.
+func connectCmd(mode *systemd.Mode) tea.Cmd {
+	return func() tea.Msg {
+		client, err := systemd.NewClient(mode)
+		return connectedMsg{client: client, err: err}
+	}
+}
+
+// loadCacheCmd reads the previous service list off disk. If the user didn't
+// pin a mode with --user/--system we guess: euid 0 → system, otherwise system
+// first then user (matches NewClient's autodetect order). The cmd returns nil
+// (a no-op msg) when no usable cache exists.
+func loadCacheCmd(requested *systemd.Mode) tea.Cmd {
+	return func() tea.Msg {
+		modes := guessCacheModes(requested)
+		for _, mode := range modes {
+			if svcs, ok := systemd.LoadServiceCache(mode); ok {
+				return cachedServicesMsg{services: svcs, mode: mode}
+			}
+		}
+		return nil
+	}
+}
+
+// guessCacheModes returns the mode(s) to probe the cache for, ordered by
+// likelihood. Matches NewClient's autodetect: system bus first unless the
+// user explicitly asked for the user bus.
+func guessCacheModes(requested *systemd.Mode) []systemd.Mode {
+	if requested != nil {
+		return []systemd.Mode{*requested}
+	}
+	return []systemd.Mode{systemd.SystemMode, systemd.UserMode}
+}
+
+// Close releases the D-Bus connection. Safe to call when the connection was
+// never established. main() calls this after p.Run() returns; doing it here
+// (instead of in main) keeps the lifecycle next to the connect logic.
+func (m *Model) Close() {
+	if m.client != nil {
+		m.client.Close()
+		m.client = nil
+	}
 }
 
 // Commands
+//
+// fetchServicesCmd kicks off a two-phase fetch: the cheap "currently-loaded
+// units" call runs first and paints the list immediately, then the slower
+// on-disk unit-file scan merges in enablement state for already-shown rows
+// and appends installed-but-not-loaded services. On a Pi 3B+ the first phase
+// returns in tens of ms while the second can take 1–2s — so the user sees
+// the list almost instantly instead of waiting on the slow half.
 func (m *Model) fetchServicesCmd() tea.Cmd {
 	m.loading = true
+	m.pendingFetches = 2
+	return tea.Batch(m.fetchLoadedServicesCmd(), m.fetchUnitFilesCmd())
+}
+
+func (m *Model) fetchLoadedServicesCmd() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		services, err := m.client.ListServices(ctx)
-		return servicesFetchedMsg{services: services, err: err}
+		services, err := m.client.ListLoadedServices(ctx)
+		return loadedServicesFetchedMsg{services: services, err: err}
+	}
+}
+
+func (m *Model) fetchUnitFilesCmd() tea.Cmd {
+	return func() tea.Msg {
+		// Bigger timeout — this is the slow call on flash storage.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		files, err := m.client.ListUnitFiles(ctx)
+		return unitFilesFetchedMsg{files: files, err: err}
 	}
 }
 
@@ -453,8 +580,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.recalculateViewportSize()
 
+	case connectedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.loading = false
+			m.initialLoad = false
+			break
+		}
+		m.client = msg.client
+		// If we showed a cache for the wrong bus (rare — only when no flag
+		// was passed and the autodetect landed somewhere our guess didn't),
+		// discard it so we don't blend buses on screen.
+		if m.showingCached && m.cachedMode != msg.client.Mode() {
+			m.services = nil
+			m.filteredServices = nil
+			m.showingCached = false
+		}
+		cmds = append(cmds, m.fetchServicesCmd())
+
+	case cachedServicesMsg:
+		// Only paint the cache if the live fetch hasn't already overwritten
+		// it — otherwise a slow cache read could clobber fresh data.
+		if !m.initialLoad {
+			break
+		}
+		m.services = msg.services
+		m.showingCached = true
+		m.cachedMode = msg.mode
+		m.initialLoad = false
+		m.filterServices()
+		// Make the cache visible. The header gets a "(cached)" tag (see
+		// renderListView), and we flash a one-shot status banner so a first-
+		// time user notices the data isn't yet live and learns about the
+		// --clear-cache / --no-cache flags.
+		cmds = append(cmds, m.triggerStatus(
+			"Showing cached list while live data loads — run with --no-cache or --clear-cache to skip/wipe.",
+			false))
+
 	case servicesFetchedMsg:
-		m.loading = false
+		// Retained for any future callers that want a single-shot refresh; the
+		// startup/refresh path now uses the two-phase messages below.
+		if m.pendingFetches > 0 {
+			m.pendingFetches--
+			if m.pendingFetches == 0 {
+				m.loading = false
+			}
+		} else {
+			m.loading = false
+		}
 		m.initialLoad = false
 		if msg.err != nil {
 			m.err = msg.err
@@ -462,6 +635,69 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.services = msg.services
 			m.filterServices()
+		}
+
+	case loadedServicesFetchedMsg:
+		if m.pendingFetches > 0 {
+			m.pendingFetches--
+			if m.pendingFetches == 0 {
+				m.loading = false
+			}
+		}
+		m.initialLoad = false
+		// Fresh live data is on screen now — the cached-data hint comes off.
+		m.showingCached = false
+		if msg.err != nil {
+			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Fetch failed: %v", msg.err), true))
+			break
+		}
+		// Paint immediately: replace the loaded slice but preserve any
+		// UnitFileState we already have for names that are still present, so a
+		// refresh (or the cached paint above) doesn't blink the Enable column
+		// back to "-" before the slower unit-file scan returns.
+		prevEnable := make(map[string]string, len(m.services))
+		for _, s := range m.services {
+			if s.UnitFileState != "" {
+				prevEnable[s.Name] = s.UnitFileState
+			}
+		}
+		for i := range msg.services {
+			if st, ok := prevEnable[msg.services[i].Name]; ok {
+				msg.services[i].UnitFileState = st
+			}
+		}
+		m.services = msg.services
+		m.filterServices()
+
+	case unitFilesFetchedMsg:
+		if m.pendingFetches > 0 {
+			m.pendingFetches--
+			if m.pendingFetches == 0 {
+				m.loading = false
+			}
+		}
+		if msg.err != nil {
+			// Non-fatal: the list still works, just without enablement info
+			// for not-loaded services. Surface a quiet status.
+			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Unit file scan failed: %v", msg.err), true))
+			break
+		}
+		m.services = systemd.MergeUnitFiles(m.services, msg.files)
+		m.filterServices()
+		// Persist the merged list so the next start can paint instantly. Fire
+		// the write off a goroutine; the file IO isn't worth a tea.Cmd round
+		// trip and any error is best-effort. Skipped under --no-cache.
+		//
+		// Always cache in name order regardless of the user's current sort.
+		// The next start opens on sortByName (zero value) — if we wrote the
+		// list in, say, memory order, the optimistic paint would briefly show
+		// rows in the wrong order before filterServices re-sorts on the live
+		// fetch. Cache-by-name keeps the two paints visually consistent.
+		if m.useCache && m.client != nil {
+			services := append([]systemd.ServiceInfo(nil), m.services...)
+			sortServices(services, sortByName)
+			mode := m.client.Mode()
+			go func() { _ = systemd.SaveServiceCache(mode, services) }()
 		}
 
 	case detailsFetchedMsg:
@@ -956,7 +1192,15 @@ func (m *Model) adjustScrollOffset(maxRows int) {
 // View renders the screen based on the current view state.
 func (m Model) View() string {
 	if m.err != nil {
-		return fmt.Sprintf("\n  Fatal Error: %v\n  Press Ctrl+C to quit.\n", m.err)
+		// If we never connected, the error is almost always a missing system
+		// bus / permission denied — surface the sudo + --user hints the
+		// command-line flow used to print.
+		hint := ""
+		if m.client == nil && (m.requestedMode == nil || *m.requestedMode == systemd.SystemMode) {
+			hint = "\n\n  Tip: Managing system units usually requires root. Try: sudo jeeves" +
+				"\n  Or run against the user bus instead:           jeeves --user"
+		}
+		return fmt.Sprintf("\n  Error: %v%s\n\n  Press Ctrl+C to quit.\n", m.err, hint)
 	}
 
 	switch m.currentView {

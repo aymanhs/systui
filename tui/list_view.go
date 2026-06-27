@@ -36,6 +36,34 @@ func (m *Model) handleListKey(msg tea.KeyMsg) tea.Cmd {
 			m.selectedIndex = 0 // wrap around
 		}
 
+	case "pgup", "ctrl+u":
+		// One viewport page up. Clamp at 0; no wrap (page-style navigation is
+		// for getting somewhere fast, wrapping would be disorienting).
+		page := m.listMaxRows()
+		if page < 1 {
+			page = 1
+		}
+		m.selectedIndex -= page
+		if m.selectedIndex < 0 {
+			m.selectedIndex = 0
+		}
+
+	case "pgdown", "ctrl+d":
+		page := m.listMaxRows()
+		if page < 1 {
+			page = 1
+		}
+		m.selectedIndex += page
+		if m.selectedIndex > len(m.filteredServices)-1 {
+			m.selectedIndex = len(m.filteredServices) - 1
+		}
+
+	case "home", "g":
+		m.selectedIndex = 0
+
+	case "end", "G":
+		m.selectedIndex = len(m.filteredServices) - 1
+
 	case "enter", "right", "l":
 		if selected != nil {
 			m.currentView = detailView
@@ -100,7 +128,20 @@ func (m Model) renderListView() string {
 
 	// 1. Header
 	title := TitleStyle.Render("SYSTEMD SERVICES")
-	modeStr := fmt.Sprintf("Bus: %s Mode", m.client.Mode().String())
+	var modeStr string
+	switch {
+	case m.client != nil:
+		modeStr = fmt.Sprintf("Bus: %s Mode", m.client.Mode().String())
+	case m.showingCached:
+		// Cache landed before the live connection — show the cached bus so
+		// the header isn't lying about which units we're displaying.
+		modeStr = fmt.Sprintf("Bus: %s Mode (cached)", m.cachedMode.String())
+	default:
+		modeStr = "Bus: Connecting..."
+	}
+	if m.showingCached && m.client != nil {
+		modeStr += " (cached)"
+	}
 	if m.loading {
 		modeStr += " [LOADING...]"
 	}
@@ -137,50 +178,92 @@ func (m Model) renderListView() string {
 		m.sortMode.String(), len(m.filteredServices)))
 	s.WriteString(modeLabel + sortLabel + "\n\n")
 
-	// 4. Services Table
+	// 4. Services Table — always render the header + separator so the empty
+	// state doesn't reflow the rest of the screen. The empty message goes in
+	// the rows area where service rows would otherwise be.
+	colStatusW := 12
+	colNameW := 35
+	colSubW := 12
+	colEnableW := 12
+	colDescW := m.width - colStatusW - colNameW - colSubW - colEnableW - 6
+	if colDescW < 15 {
+		colDescW = 15 // min fallback
+	}
+
+	// Sorted-column indicator: append " ▼"/" ▲" to the header of whichever
+	// column drives the current sort. Memory/PID don't have their own
+	// columns, so they fall back to the existing "Sort: memory" subtitle
+	// for feedback.
+	statusHdr := "STATUS"
+	nameHdr := "SERVICE NAME"
+	switch m.sortMode {
+	case sortByState:
+		statusHdr += " ▼"
+	case sortByName:
+		nameHdr += " ▲" // names sort ascending (A→Z); state surfaces failures first
+	}
+
+	// Render each cell with its own style — wrapping a pre-styled row in
+	// TableHeaderStyle would inherit-then-reset colors at the inner ESC[0m
+	// boundaries (lipgloss styles don't compose cleanly when nested), which
+	// is what made the sorted-column color/arrow look broken before. Spaces
+	// between cells are intentionally plain so the resets land in the
+	// margins, never mid-label. Pad first, then style, so the padded width
+	// is what the eye measures and the trailing spaces also pick up the
+	// header color/underline.
+	headerCell := func(label string, width int, active bool) string {
+		style := TableHeaderStyle
+		if active {
+			style = style.Underline(true)
+		}
+		return style.Render(padRight(label, width))
+	}
+
+	statusCell := headerCell(statusHdr, colStatusW, m.sortMode == sortByState)
+	nameCell := headerCell(nameHdr, colNameW, m.sortMode == sortByName)
+	subCell := headerCell("SUB STATE", colSubW, false)
+	enableCell := headerCell("ENABLE STATE", colEnableW, false)
+	descCell := headerCell("DESCRIPTION", colDescW, false)
+
+	headerRow := "  " + statusCell + " " + nameCell + " " + subCell + " " + enableCell + " " + descCell
+	s.WriteString(headerRow + "\n")
+	s.WriteString(lipgloss.NewStyle().Foreground(ColorDim).Render(strings.Repeat("-", m.width)) + "\n")
+
+	// Calculate scrolling viewport for list. Must match listMaxRows() in
+	// model.go so the scroll-offset clamp and the renderer agree.
+	maxRows := m.listMaxRows()
+	renderedRows := 0
+
 	if len(m.filteredServices) == 0 {
+		var msg string
 		switch {
 		case m.initialLoad:
-			s.WriteString("\n  " + HelpDescStyle.Render("Loading services...") + "\n")
+			msg = "Loading services..."
 		case m.loading:
-			s.WriteString("\n  " + HelpDescStyle.Render("Refreshing...") + "\n")
+			msg = "Refreshing..."
 		default:
-			s.WriteString("\n  No services found matching filters.\n")
+			// Mode-aware empty message — "no failed services" reads very
+			// differently from "no matches for your filter".
+			switch {
+			case m.filterQuery != "":
+				msg = fmt.Sprintf("No services match %q.", m.filterQuery)
+			case m.showMode == showFailed:
+				msg = "No failed services 🎉"
+			case m.showMode == showRunning:
+				msg = "No running services."
+			default:
+				msg = "No services found."
+			}
 		}
+		s.WriteString("  " + HelpDescStyle.Render(msg) + "\n")
+		renderedRows = 1
 	} else {
-		// Table Columns configuration
-		colStatusW := 12
-		colNameW := 35
-		colSubW := 12
-		colEnableW := 12
-		colDescW := m.width - colStatusW - colNameW - colSubW - colEnableW - 6
-		if colDescW < 15 {
-			colDescW = 15 // min fallback
-		}
-
-		// Table Header
-		headerRow := fmt.Sprintf("  %s %s %s %s %s",
-			padRight("STATUS", colStatusW),
-			padRight("SERVICE NAME", colNameW),
-			padRight("SUB STATE", colSubW),
-			padRight("ENABLE STATE", colEnableW),
-			padRight("DESCRIPTION", colDescW),
-		)
-		s.WriteString(TableHeaderStyle.Render(headerRow) + "\n")
-		s.WriteString(lipgloss.NewStyle().Foreground(ColorDim).Render(strings.Repeat("-", m.width)) + "\n")
-
-		// Calculate scrolling viewport for list. Must match listMaxRows() in
-		// model.go so the scroll-offset clamp and the renderer agree.
-		maxRows := m.listMaxRows()
-
 		start := m.scrollOffset
 		end := start + maxRows
 		if end > len(m.filteredServices) {
 			end = len(m.filteredServices)
 		}
 
-		// Render rows
-		renderedRows := 0
 		for i := start; i < end; i++ {
 			svc := m.filteredServices[i]
 			renderedRows++
@@ -208,11 +291,11 @@ func (m Model) renderListView() string {
 				s.WriteString(RowStyle.Render("  "+rowText) + "\n")
 			}
 		}
+	}
 
-		// Pad with empty rows to keep status and help pinned to bottom
-		for i := renderedRows; i < maxRows; i++ {
-			s.WriteString("\n")
-		}
+	// Pad with empty rows to keep status and help pinned to bottom
+	for i := renderedRows; i < maxRows; i++ {
+		s.WriteString("\n")
 	}
 
 	// 5. Status banner (errors or success) - always exactly 2 lines
@@ -273,6 +356,8 @@ func (m Model) formatEnableState(state string) string {
 func (m Model) renderListFooter() string {
 	return "\n" + RenderFooter([]string{
 		"↑/↓/k/j", "Navigate",
+		"PgUp/PgDn", "Page",
+		"g/G", "Top/Bottom",
 		"Enter/→", "Details",
 		"s/t/r", "Start/Stop/Restart",
 		"e/d", "Enable/Disable",

@@ -140,63 +140,82 @@ func (c *Client) Mode() Mode {
 	return c.mode
 }
 
-// ListServices fetches all service units and merges their active states and enablement states.
-func (c *Client) ListServices(ctx context.Context) ([]ServiceInfo, error) {
-	// 1. Fetch active units from ListUnits
-	units, err := c.conn.ListUnitsContext(ctx)
+// ListLoadedServices fetches only the *.service units systemd already has in
+// memory — active, activating, failed, or recently-loaded. It's the cheap half
+// of a full listing: no disk scan, no [Install]-section parsing. On a Pi 3B+
+// this returns in tens of ms vs hundreds for the full list.
+//
+// UnitFileState is left empty on the returned entries; merge with
+// ListUnitFiles (or call ListServices for both in one shot) to fill it in.
+func (c *Client) ListLoadedServices(ctx context.Context) ([]ServiceInfo, error) {
+	units, err := c.conn.ListUnitsByPatternsContext(ctx, nil, []string{"*.service"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list units: %w", err)
 	}
 
-	// Map to accumulate services by name
-	servicesMap := make(map[string]*ServiceInfo)
-
+	services := make([]ServiceInfo, 0, len(units))
 	for _, u := range units {
+		// systemd globs match against aliases too, so the pattern filter can
+		// still let non-service entries through. Belt-and-braces.
 		if !strings.HasSuffix(u.Name, ".service") {
 			continue
 		}
-
-		servicesMap[u.Name] = &ServiceInfo{
+		services = append(services, ServiceInfo{
 			Name:        u.Name,
 			Description: u.Description,
 			LoadState:   u.LoadState,
 			ActiveState: u.ActiveState,
 			SubState:    u.SubState,
-		}
+		})
 	}
-
-	// 2. Fetch all unit files to get their enablement status
-	unitFiles, err := c.conn.ListUnitFilesContext(ctx)
-	if err == nil {
-		for _, uf := range unitFiles {
-			name := filepath.Base(uf.Path)
-			if !strings.HasSuffix(name, ".service") {
-				continue
-			}
-
-			if info, exists := servicesMap[name]; exists {
-				info.UnitFileState = uf.Type
-			} else {
-				// Unit is not currently loaded/active but exists in system
-				servicesMap[name] = &ServiceInfo{
-					Name:          name,
-					Description:   "",
-					LoadState:     "not-loaded",
-					ActiveState:   "inactive",
-					SubState:      "dead",
-					UnitFileState: uf.Type,
-				}
-			}
-		}
-	}
-
-	// Convert map to slice
-	services := make([]ServiceInfo, 0, len(servicesMap))
-	for _, s := range servicesMap {
-		services = append(services, *s)
-	}
-
 	return services, nil
+}
+
+// ListUnitFiles fetches the on-disk enablement state for every installed
+// service. This is the expensive half — systemd scans every unit directory
+// and parses [Install] sections — and the dominant cost of a cold listing on
+// slow flash storage.
+func (c *Client) ListUnitFiles(ctx context.Context) ([]ServiceInfo, error) {
+	unitFiles, err := c.conn.ListUnitFilesByPatternsContext(ctx, nil, []string{"*.service"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list unit files: %w", err)
+	}
+
+	out := make([]ServiceInfo, 0, len(unitFiles))
+	for _, uf := range unitFiles {
+		name := filepath.Base(uf.Path)
+		if !strings.HasSuffix(name, ".service") {
+			continue
+		}
+		out = append(out, ServiceInfo{
+			Name:          name,
+			LoadState:     "not-loaded",
+			ActiveState:   "inactive",
+			SubState:      "dead",
+			UnitFileState: uf.Type,
+		})
+	}
+	return out, nil
+}
+
+// MergeUnitFiles splices enablement state from a ListUnitFiles result into a
+// loaded-services list, and appends any installed-but-not-loaded services
+// that weren't in `loaded`. The returned slice is unsorted — callers re-sort
+// through filterServices anyway.
+func MergeUnitFiles(loaded, files []ServiceInfo) []ServiceInfo {
+	byName := make(map[string]int, len(loaded))
+	for i := range loaded {
+		byName[loaded[i].Name] = i
+	}
+	for _, f := range files {
+		if idx, ok := byName[f.Name]; ok {
+			loaded[idx].UnitFileState = f.UnitFileState
+		} else {
+			loaded = append(loaded, f)
+			byName[f.Name] = len(loaded) - 1
+		}
+	}
+	return loaded
 }
 
 // GetServiceDetails fetches detailed properties for a specific service.
