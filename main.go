@@ -5,12 +5,18 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/aymanhs/jeeves/systemd"
 	"github.com/aymanhs/jeeves/tui"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// version is the release tag baked in at link time by the release workflow
+// (`-ldflags="-X main.version=v0.1.0"`). Local builds keep "dev" so it's
+// obvious when somebody pasted an un-versioned binary into a bug report.
+var version = "dev"
 
 func main() {
 	// Flags
@@ -19,10 +25,19 @@ func main() {
 	noCacheFlag := flag.Bool("no-cache", false, "Skip the on-disk service-list cache for this run (no read, no write)")
 	clearCacheFlag := flag.Bool("clear-cache", false, "Delete jeeves' on-disk service-list cache and exit")
 	cacheInfoFlag := flag.Bool("cache-info", false, "Print where the on-disk cache lives and what's in it, then exit")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
+	flag.BoolVar(versionFlag, "v", false, "Print version and exit")
 	helpFlag := flag.Bool("help", false, "Show help information")
 	flag.BoolVar(helpFlag, "h", false, "Show help information")
 
 	flag.Parse()
+
+	if *versionFlag {
+		// One line, no decoration — easy to grep, easy to paste into a bug
+		// report. GOOS/GOARCH on the same line tells us what build it is.
+		fmt.Printf("jeeves %s %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
+		os.Exit(0)
+	}
 
 	if *helpFlag {
 		printHelp()
@@ -93,6 +108,7 @@ func printHelp() {
 	fmt.Println("  --no-cache     Skip the on-disk service-list cache for this run")
 	fmt.Println("  --clear-cache  Delete jeeves' on-disk cache and exit")
 	fmt.Println("  --cache-info   Show where the cache lives and what's in it, then exit")
+	fmt.Println("  -v, --version  Print version and exit")
 	fmt.Println("  -h, --help     Show this help information")
 	fmt.Println("\nCache:")
 	fmt.Println("  To make startup snappy on slow hardware, jeeves caches the merged")
