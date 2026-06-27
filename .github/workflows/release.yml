@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # required to create a release and upload assets
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+          - target: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: "7"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        # Inject the tag as main.version so `jeeves --version` prints it.
+        # -trimpath strips local FS paths; -s -w drops debug info to shrink
+        # the binary (~6 MB → ~4 MB).
+        run: |
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o jeeves .
+
+      - name: Package
+        run: |
+          tarball="jeeves-${{ matrix.target }}.tar.gz"
+          tar czf "$tarball" jeeves LICENSE README.md
+          # SHA-256 next to the tarball — the publish job aggregates these
+          # into a single checksums.txt asset on the release.
+          sha256sum "$tarball" > "$tarball.sha256"
+          ls -lh "$tarball" "$tarball.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jeeves-${{ matrix.target }}
+          path: |
+            jeeves-${{ matrix.target }}.tar.gz
+            jeeves-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        # One checksums.txt at the release covering every tarball — users
+        # verify with `sha256sum -c checksums.txt` after downloading.
+        working-directory: dist
+        run: |
+          cat *.sha256 > checksums.txt
+          rm *.sha256
+          ls -lh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        # --generate-notes asks GitHub to build a changelog from PRs/commits
+        # since the previous tag. For the first release it falls back to the
+        # commit list, which is fine.
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            dist/*

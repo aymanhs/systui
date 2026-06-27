@@ -1,5 +1,6 @@
 # jeeves
 
+[![CI](https://github.com/aymanhs/jeeves/actions/workflows/ci.yml/badge.svg)](https://github.com/aymanhs/jeeves/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/aymanhs/jeeves.svg)](https://pkg.go.dev/github.com/aymanhs/jeeves)
 [![Go Report Card](https://goreportcard.com/badge/github.com/aymanhs/jeeves)](https://goreportcard.com/report/github.com/aymanhs/jeeves)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
