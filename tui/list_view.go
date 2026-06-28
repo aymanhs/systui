@@ -125,9 +125,13 @@ func (m *Model) handleListKey(msg tea.KeyMsg) tea.Cmd {
 
 func (m Model) renderListView() string {
 	var s strings.Builder
+	contentW := m.width - 2
+	if contentW < 40 {
+		contentW = 40
+	}
 
 	// 1. Header
-	title := TitleStyle.Render("SYSTEMD SERVICES")
+	title := TitleStyle.Render(strings.ToUpper(m.appName) + " v" + m.appVersion)
 	var modeStr string
 	switch {
 	case m.client != nil:
@@ -146,22 +150,27 @@ func (m Model) renderListView() string {
 		modeStr += " [LOADING...]"
 	}
 	subtitle := SubTitleStyle.Render(modeStr)
-	s.WriteString(lipgloss.JoinHorizontal(lipgloss.Center, title, subtitle) + "\n\n")
+	header := lipgloss.JoinHorizontal(lipgloss.Top, title, "  ", subtitle)
+	s.WriteString(ansi.Truncate(header, contentW, "") + "\n")
 
 	// 2. Search / Filter bar
 	if m.filtering {
-		// While typing: framed input box + an explicit hint so the user can see
-		// that keypresses are being captured by the filter, not the list.
+		// Render active search as plain text so typed input is always visible.
 		label := SearchActiveLabel.Render(" FILTER ")
-		input := SearchActiveBox.Render(m.searchInput.View())
+		query := m.searchInput.Value()
+		if query == "" {
+			query = m.searchInput.Placeholder
+		}
+		input := SearchInputStyle.Render("/ " + query + "_")
 		hint := HelpDescStyle.Render("  Enter / Esc to apply")
-		s.WriteString(label + " " + input + hint + "\n\n")
+		row := lipgloss.JoinHorizontal(lipgloss.Top, label, " ", input, hint)
+		s.WriteString(ansi.Truncate(row, contentW, "") + "\n")
 	} else if m.filterQuery != "" {
 		filterText := SearchPromptStyle.Render("Filter: ") + SearchInputStyle.Render(m.filterQuery)
 		infoText := HelpDescStyle.Render(" (press / to edit, esc to clear)")
-		s.WriteString(filterText + infoText + "\n\n")
+		s.WriteString(ansi.Truncate(filterText+infoText, contentW, "") + "\n")
 	} else {
-		s.WriteString(HelpDescStyle.Render("Press / to search/filter services, [a] to toggle view...") + "\n\n")
+		s.WriteString(ansi.Truncate(HelpDescStyle.Render("Press / to search/filter services, [a] to toggle view..."), contentW, "") + "\n")
 	}
 
 	// 3. Mode + sort indicator
@@ -176,7 +185,7 @@ func (m Model) renderListView() string {
 	}
 	sortLabel := HelpDescStyle.Render(fmt.Sprintf("  •  Sort: %s  •  %d shown",
 		m.sortMode.String(), len(m.filteredServices)))
-	s.WriteString(modeLabel + sortLabel + "\n\n")
+	s.WriteString(modeLabel + sortLabel + "\n")
 
 	// 4. Services Table — always render the header + separator so the empty
 	// state doesn't reflow the rest of the screen. The empty message goes in
@@ -185,7 +194,7 @@ func (m Model) renderListView() string {
 	colNameW := 35
 	colSubW := 12
 	colEnableW := 12
-	colDescW := m.width - colStatusW - colNameW - colSubW - colEnableW - 6
+	colDescW := contentW - colStatusW - colNameW - colSubW - colEnableW - 7
 	if colDescW < 15 {
 		colDescW = 15 // min fallback
 	}
@@ -225,9 +234,9 @@ func (m Model) renderListView() string {
 	enableCell := headerCell("ENABLE STATE", colEnableW, false)
 	descCell := headerCell("DESCRIPTION", colDescW, false)
 
-	headerRow := "  " + statusCell + " " + nameCell + " " + subCell + " " + enableCell + " " + descCell
-	s.WriteString(headerRow + "\n")
-	s.WriteString(lipgloss.NewStyle().Foreground(ColorDim).Render(strings.Repeat("-", m.width)) + "\n")
+	headerRow := "   " + statusCell + " " + nameCell + " " + subCell + " " + enableCell + " " + descCell
+	s.WriteString(ansi.Truncate(headerRow, contentW, "") + "\n")
+	s.WriteString(lipgloss.NewStyle().Foreground(ColorDim).Render(strings.Repeat("-", contentW)) + "\n")
 
 	// Calculate scrolling viewport for list. Must match listMaxRows() in
 	// model.go so the scroll-offset clamp and the renderer agree.
@@ -269,11 +278,16 @@ func (m Model) renderListView() string {
 			renderedRows++
 
 			// Format columns
-			statusIndicator := m.formatActiveState(svc.ActiveState)
 			nameStr := svc.Name
 			subStateStr := svc.SubState
-			enableStateStr := m.formatEnableState(svc.UnitFileState)
 			descStr := svc.Description
+
+			statusIndicator := m.formatActiveState(svc.ActiveState)
+			enableStateStr := m.formatEnableState(svc.UnitFileState)
+			if i == m.selectedIndex {
+				statusIndicator = m.formatActiveStatePlain(svc.ActiveState)
+				enableStateStr = m.formatEnableStatePlain(svc.UnitFileState)
+			}
 
 			rowText := fmt.Sprintf("%s %s %s %s %s",
 				padRight(statusIndicator, colStatusW),
@@ -282,13 +296,18 @@ func (m Model) renderListView() string {
 				padRight(enableStateStr, colEnableW),
 				padRight(descStr, colDescW),
 			)
+			innerRowW := contentW - 3
+			if innerRowW < 1 {
+				innerRowW = 1
+			}
+			lineBody := padRight(rowText, innerRowW)
 
 			if i == m.selectedIndex {
-				// Selected Row
-				s.WriteString(SelectedRowStyle.Render("➜ "+rowText) + "\n")
+				selectedLine := "➜ " + lineBody
+				s.WriteString(SelectedRowStyle.Render(selectedLine) + "\n")
 			} else {
 				// Regular Row
-				s.WriteString(RowStyle.Render("  "+rowText) + "\n")
+				s.WriteString(RowStyle.Render("  "+lineBody) + "\n")
 			}
 		}
 	}
@@ -351,6 +370,22 @@ func (m Model) formatEnableState(state string) string {
 	default:
 		return InactiveBadge.Render(state)
 	}
+}
+
+func (m Model) formatActiveStatePlain(state string) string {
+	switch state {
+	case "":
+		return "-"
+	default:
+		return state
+	}
+}
+
+func (m Model) formatEnableStatePlain(state string) string {
+	if state == "" {
+		return "-"
+	}
+	return state
 }
 
 func (m Model) renderListFooter() string {

@@ -83,7 +83,7 @@ func main() {
 	// "Connecting..." status, then the connect + first fetch run in the
 	// background.
 	useCache := !*noCacheFlag
-	model := tui.NewModel(mode, useCache)
+	model := tui.NewModel(mode, useCache, version)
 
 	// Initialize Bubble Tea program. WithMouseCellMotion enables scroll-wheel
 	// support inside viewports (logs, unit file).

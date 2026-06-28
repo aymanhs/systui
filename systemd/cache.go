@@ -12,7 +12,10 @@ import (
 // cacheVersion bumps whenever ServiceInfo's wire shape changes — readers
 // silently discard caches written by a different version rather than risk
 // surfacing stale fields decoded into the wrong slots.
-const cacheVersion = 1
+//
+// v2 also invalidates older snapshots that may have been written from a
+// filtered UI state in pre-fix builds.
+const cacheVersion = 2
 
 // cacheMaxAge is how long we'll still paint a cached list before treating it
 // as too stale to show. Practically infinite (services don't churn between
@@ -147,6 +150,12 @@ func LoadServiceCache(mode Mode) ([]ServiceInfo, bool) {
 	if len(cf.Services) == 0 {
 		return nil, false
 	}
+	// A usable startup cache must come from the merged loaded+unit-files list.
+	// Loaded-only snapshots (from pre-fix builds) typically have no
+	// UnitFileState at all and collapse the UI to just currently-loaded units.
+	if !hasUnitFileStates(cf.Services) {
+		return nil, false
+	}
 	return cf.Services, true
 }
 
@@ -157,6 +166,12 @@ func SaveServiceCache(mode Mode, services []ServiceInfo) error {
 	path := CachePath(mode)
 	if path == "" {
 		return errors.New("no cache dir available")
+	}
+	if len(services) == 0 {
+		return errors.New("refusing to cache empty service list")
+	}
+	if !hasUnitFileStates(services) {
+		return errors.New("refusing to cache loaded-only snapshot")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir cache dir: %w", err)
@@ -182,4 +197,13 @@ func SaveServiceCache(mode Mode, services []ServiceInfo) error {
 		return fmt.Errorf("rename cache: %w", err)
 	}
 	return nil
+}
+
+func hasUnitFileStates(services []ServiceInfo) bool {
+	for _, s := range services {
+		if s.UnitFileState != "" {
+			return true
+		}
+	}
+	return false
 }

@@ -176,6 +176,9 @@ type cachedServicesMsg struct {
 
 // Model represents the bubbletea application state.
 type Model struct {
+	appName    string
+	appVersion string
+
 	client           *systemd.Client
 	requestedMode    *systemd.Mode // honored when client is connected lazily
 	useCache         bool          // false → skip both cache read on startup and cache write after fetch
@@ -254,10 +257,10 @@ type Model struct {
 // useCache controls the optimistic-paint cache (see systemd/cache.go). When
 // false, no cache file is read on startup and no cache is written after the
 // fetch completes — wired up to the --no-cache CLI flag.
-func NewModel(mode *systemd.Mode, useCache bool) Model {
+func NewModel(mode *systemd.Mode, useCache bool, appVersion string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Type to filter services..."
-	ti.Prompt = " 🔍 "
+	ti.Prompt = "/ "
 	ti.PromptStyle = SearchPromptStyle
 	ti.TextStyle = SearchInputStyle
 	ti.CharLimit = 128 // service names go up to ~70 chars; leave room for typos + paste
@@ -269,6 +272,8 @@ func NewModel(mode *systemd.Mode, useCache bool) Model {
 	uvp.KeyMap = viewport.DefaultKeyMap()
 
 	return Model{
+		appName:              "jeeves",
+		appVersion:           appVersion,
 		requestedMode:        mode,
 		useCache:             useCache,
 		searchInput:          ti,
@@ -588,6 +593,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.client = msg.client
+		if m.requestedMode == nil && m.client.Mode() == systemd.UserMode {
+			cmds = append(cmds, m.triggerStatus(
+				"Auto-fallback to user bus (run with sudo for system units).",
+				false))
+		}
 		// If we showed a cache for the wrong bus (rare — only when no flag
 		// was passed and the autodetect landed somewhere our guess didn't),
 		// discard it so we don't blend buses on screen.
@@ -609,13 +619,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cachedMode = msg.mode
 		m.initialLoad = false
 		m.filterServices()
-		// Make the cache visible. The header gets a "(cached)" tag (see
-		// renderListView), and we flash a one-shot status banner so a first-
-		// time user notices the data isn't yet live and learns about the
-		// --clear-cache / --no-cache flags.
-		cmds = append(cmds, m.triggerStatus(
-			"Showing cached list while live data loads — run with --no-cache or --clear-cache to skip/wipe.",
-			false))
+		// The header already shows a "(cached)" tag; avoid a long startup
+		// banner here because it can wrap and temporarily crowd the list down
+		// to only a couple visible rows on smaller terminals.
 
 	case servicesFetchedMsg:
 		// Retained for any future callers that want a single-shot refresh; the
@@ -638,6 +644,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case loadedServicesFetchedMsg:
+		wasInitialLoad := m.initialLoad
+		hadCachedPaint := m.showingCached
 		if m.pendingFetches > 0 {
 			m.pendingFetches--
 			if m.pendingFetches == 0 {
@@ -645,29 +653,59 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.initialLoad = false
-		// Fresh live data is on screen now — the cached-data hint comes off.
-		m.showingCached = false
 		if msg.err != nil {
 			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Fetch failed: %v", msg.err), true))
 			break
 		}
-		// Paint immediately: replace the loaded slice but preserve any
-		// UnitFileState we already have for names that are still present, so a
-		// refresh (or the cached paint above) doesn't blink the Enable column
-		// back to "-" before the slower unit-file scan returns.
-		prevEnable := make(map[string]string, len(m.services))
-		for _, s := range m.services {
-			if s.UnitFileState != "" {
-				prevEnable[s.Name] = s.UnitFileState
+		// Make this phase order-independent: if we already have a superset with
+		// UnitFileState data (from cache or because unit-files phase landed
+		// first), splice live loaded state onto that superset instead of
+		// replacing it with the loaded-only subset.
+		if hasAnyUnitFileState(m.services) && len(m.services) >= len(msg.services) {
+			liveByName := make(map[string]systemd.ServiceInfo, len(msg.services))
+			for _, ls := range msg.services {
+				liveByName[ls.Name] = ls
 			}
-		}
-		for i := range msg.services {
-			if st, ok := prevEnable[msg.services[i].Name]; ok {
-				msg.services[i].UnitFileState = st
+
+			merged := append([]systemd.ServiceInfo(nil), m.services...)
+			for i := range merged {
+				if ls, ok := liveByName[merged[i].Name]; ok {
+					merged[i].Description = ls.Description
+					merged[i].LoadState = ls.LoadState
+					merged[i].ActiveState = ls.ActiveState
+					merged[i].SubState = ls.SubState
+					delete(liveByName, merged[i].Name)
+				}
 			}
+			// If a live loaded unit wasn't present in cache, append it.
+			for _, ls := range liveByName {
+				merged = append(merged, ls)
+			}
+			m.services = merged
+		} else {
+			// Paint immediately: replace the loaded slice but preserve any
+			// UnitFileState we already have for names that are still present, so a
+			// refresh doesn't blink the Enable column back to "-" before the
+			// slower unit-file scan returns.
+			prevEnable := make(map[string]string, len(m.services))
+			for _, s := range m.services {
+				if s.UnitFileState != "" {
+					prevEnable[s.Name] = s.UnitFileState
+				}
+			}
+			for i := range msg.services {
+				if st, ok := prevEnable[msg.services[i].Name]; ok {
+					msg.services[i].UnitFileState = st
+				}
+			}
+			m.services = msg.services
 		}
-		m.services = msg.services
-		m.filterServices()
+		// On the very first load without cache, don't paint the loaded-only
+		// subset (often just 1-2 active units). Wait for the unit-file phase
+		// so startup doesn't appear to "randomly" show tiny lists.
+		if !(wasInitialLoad && !hadCachedPaint) {
+			m.filterServices()
+		}
 
 	case unitFilesFetchedMsg:
 		if m.pendingFetches > 0 {
@@ -680,9 +718,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Non-fatal: the list still works, just without enablement info
 			// for not-loaded services. Surface a quiet status.
 			cmds = append(cmds, m.triggerStatus(fmt.Sprintf("Unit file scan failed: %v", msg.err), true))
+			if len(m.filteredServices) == 0 && len(m.services) > 0 {
+				// If we intentionally held back loaded-only paint during initial
+				// startup, fall back to it when phase 2 fails so the user still
+				// sees something useful.
+				m.filterServices()
+			}
 			break
 		}
 		m.services = systemd.MergeUnitFiles(m.services, msg.files)
+		// Full live merge has landed; clear the cached-data hint now.
+		m.showingCached = false
 		m.filterServices()
 		// Persist the merged list so the next start can paint instantly. Fire
 		// the write off a goroutine; the file IO isn't worth a tea.Cmd round
@@ -693,7 +739,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// list in, say, memory order, the optimistic paint would briefly show
 		// rows in the wrong order before filterServices re-sorts on the live
 		// fetch. Cache-by-name keeps the two paints visually consistent.
-		if m.useCache && m.client != nil {
+		// Also skip writes while a filter is active (text or mode). m.services
+		// should already be the canonical unfiltered backing slice, but this
+		// guard avoids persisting a confusing subset if that invariant ever
+		// regresses again.
+		if m.useCache && m.client != nil && m.filterQuery == "" && m.showMode == showAll {
 			services := append([]systemd.ServiceInfo(nil), m.services...)
 			sortServices(services, sortByName)
 			mode := m.client.Mode()
@@ -850,7 +900,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.filtering {
 			// Search Input handling
 			switch msg.String() {
-			case "enter", "esc":
+			case "enter":
+				m.filtering = false
+				m.searchInput.Blur()
+				m.filterServices()
+			case "esc":
+				m.filterQuery = ""
+				m.searchInput.SetValue("")
 				m.filtering = false
 				m.searchInput.Blur()
 				m.filterServices()
@@ -958,11 +1014,23 @@ func (m *Model) recalculateViewportSize() {
 // listMaxRows is the number of service rows the list view can show. Used by both
 // the renderer and the scroll-offset clamp so the two never drift apart.
 //
-//	2 page header + 2 search bar + 2 mode row + 2 table header rows
-//	+ 2 status banner + 4 footer = 14 rows of chrome, but the existing
-//	tuning used 12 (the renderer was rendering an extra blank gap).
-//	Keep the empirically-correct value to preserve current behavior.
+//	1 page header row (title+version + bus status)
+//	1 search row
+//	1 mode row
+//	2 table header rows
+//	2 status banner rows
+//	5 footer rows (explicit leading newline + footer margin/border/padding/content)
+//
+// = 12 rows of chrome.
 func (m Model) listMaxRows() int {
+	if m.height <= 0 {
+		// Before the first WindowSizeMsg lands, avoid clamping the list to the
+		// minimum 2-3 visible rows (which looks like "randomly only 2 services").
+		if n := len(m.filteredServices); n > 0 {
+			return n
+		}
+		return 20
+	}
 	r := m.height - 12
 	if r < 3 {
 		r = 3
@@ -1069,6 +1137,15 @@ func truncateLines(s string, width int) string {
 		b.WriteString(ansi.Truncate(line, width, ""))
 	}
 	return b.String()
+}
+
+func hasAnyUnitFileState(services []systemd.ServiceInfo) bool {
+	for _, s := range services {
+		if s.UnitFileState != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) filterServices() {

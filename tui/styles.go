@@ -43,6 +43,7 @@ var (
 	ColorWarning  = lipgloss.Color("#f59e0b") // Amber 500
 	ColorEnabled  = lipgloss.Color("#14b8a6") // Teal 500
 	ColorDisabled = lipgloss.Color("#6b7280") // Gray 500
+	ColorSelected = lipgloss.Color("#1e3a8a") // Blue 800
 )
 
 // Styles
@@ -77,7 +78,7 @@ var (
 			PaddingLeft(1)
 
 	SelectedRowStyle = lipgloss.NewStyle().
-				Background(ColorPrimary).
+				Background(ColorSelected).
 				Foreground(lipgloss.Color("#ffffff")).
 				Bold(true).
 				PaddingLeft(1)
@@ -182,9 +183,4 @@ var (
 				Background(ColorPrimary).
 				Foreground(lipgloss.Color("#ffffff")).
 				Bold(true)
-
-	SearchActiveBox = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorPrimary).
-			Padding(0, 1)
 )
